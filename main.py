@@ -2,6 +2,7 @@ import os
 import pyodbc
 import pandas as pd
 import numpy as np
+from datetime import date, datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -88,11 +89,23 @@ async def hr_dashboard():
             "engagement_score": 0,
         }
 
-        # NaN / inf ko JSON-safe banane ke liye helper
+        # NaN / inf / date ko JSON-safe banane ke liye helper
         def df_safe(df: pd.DataFrame):
-            return df.replace(
-                {np.nan: None, np.inf: None, -np.inf: None}
-            ).to_dict(orient="records")
+            # NaN / inf clean
+            df = df.replace({np.nan: None, np.inf: None, -np.inf: None})
+
+            # date/datetime -> string (ISO format)
+            for col in df.columns:
+                if df[col].dtype == "datetime64[ns]":
+                    df[col] = df[col].dt.strftime("%Y-%m-%d")
+                else:
+                    df[col] = df[col].apply(
+                        lambda v: v.isoformat()
+                        if isinstance(v, (date, datetime))
+                        else v
+                    )
+
+            return df.to_dict(orient="records")
 
         payload = {
             "employee": employee_summary,
