@@ -1,13 +1,14 @@
 import os
 import pyodbc
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from ai_logic import answer_ceo_question  # AI logic
-
 
 # .env load (DB_PASSWORD, OPENAI_API_KEY, etc.)
 load_dotenv()
@@ -50,12 +51,14 @@ def df_to_list(df: pd.DataFrame):
 
 # ---------- Root health-check ----------
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "CEO AI Backend running"}
 
 
 # ---------- HR dashboard endpoint ----------
+
 
 @app.get("/api/hr-dashboard")
 async def hr_dashboard():
@@ -85,19 +88,28 @@ async def hr_dashboard():
             "engagement_score": 0,
         }
 
-        return {
+        # NaN / inf ko JSON-safe banane ke liye helper
+        def df_safe(df: pd.DataFrame):
+            return df.replace(
+                {np.nan: None, np.inf: None, -np.inf: None}
+            ).to_dict(orient="records")
+
+        payload = {
             "employee": employee_summary,
-            "employees": df_to_list(employees_df),
-            "new_joiners": df_to_list(new_joiners_df),
-            "instructors": df_to_list(instructor_df),
+            "employees": df_safe(employees_df),
+            "new_joiners": df_safe(new_joiners_df),
+            "instructors": df_safe(instructor_df),
             "employee_trend": [],
-            "former": df_to_list(former_df),
+            "former": df_safe(former_df),
         }
+
+        return JSONResponse(content=payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------- Models ----------
+
 
 class ChatRequest(BaseModel):
     prompt: str
@@ -108,6 +120,7 @@ class ChatResponse(BaseModel):
 
 
 # ---------- AI chat endpoint (uses ai_logic) ----------
+
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_with_ceo_ai(body: ChatRequest):
@@ -181,7 +194,8 @@ async def chat_with_ceo_ai(body: ChatRequest):
             good_mask = instructor_df["overall_rating"].str.lower() == "exceed expectations"
             performance_metrics["exceed_expectations_pct"] = (
                 round((good_mask.sum() / total_reviews) * 100, 1)
-                if total_reviews else 0.0
+                if total_reviews
+                else 0.0
             )
 
             # Top performer by overall_score, phir recent review_date
@@ -201,7 +215,7 @@ async def chat_with_ceo_ai(body: ChatRequest):
             former_df=former_df,
             base_metrics=base_metrics,
             performance_metrics=performance_metrics,
-             new_joiners_df=new_joiners_df,
+            new_joiners_df=new_joiners_df,
         )
 
         return ChatResponse(reply=reply)
