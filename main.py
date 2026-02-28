@@ -73,7 +73,39 @@ def make_json_safe(obj):
         return v
     if isinstance(obj, (date, datetime)):
         return obj.isoformat()
+    # Handle numpy bool
+    if isinstance(obj, np.bool_):
+        return bool(obj)
     return obj
+
+
+def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fully sanitize a DataFrame:
+    - Replace NaN/inf/-inf with None
+    - Convert datetime64 columns to ISO date strings
+    - Convert any remaining numpy types to native Python types
+    """
+    # Replace inf values first, then NaN
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.where(pd.notnull(df), None)
+
+    for col in df.columns:
+        # datetime64 → string
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].dt.strftime("%Y-%m-%d").where(df[col].notna(), None)
+        # object columns may contain mixed types including numpy scalars
+        elif df[col].dtype == object:
+            df[col] = df[col].apply(
+                lambda x: x.item() if isinstance(x, (np.floating, np.integer, np.bool_)) else x
+            )
+
+    return df
+
+
+def df_safe(df: pd.DataFrame):
+    """Clean DataFrame and convert to list of dicts safe for JSON serialization."""
+    return clean_df(df).to_dict(orient="records")
 
 
 # ---------- Root health-check ----------
@@ -115,15 +147,6 @@ async def hr_dashboard():
             "engagement_score": 0,
         }
 
-        # DataFrames ko basic NaN/inf clean + list me convert
-        def df_safe(df: pd.DataFrame):
-            df = df.replace({np.nan: None, np.inf: None, -np.inf: None})
-            # datetime64 columns ko string bana do
-            for col in df.columns:
-                if df[col].dtype == "datetime64[ns]":
-                    df[col] = df[col].dt.strftime("%Y-%m-%d")
-            return df.to_dict(orient="records")
-
         payload = {
             "employee": employee_summary,
             "employees": df_safe(employees_df),
@@ -163,6 +186,12 @@ async def chat_with_ceo_ai(body: ChatRequest):
         new_joiners_df = pd.read_sql(f"SELECT * FROM [{NEW_JOINERS_TABLE}]", conn)
         conn.close()
 
+        # Sanitize all DataFrames before any processing
+        employees_df = clean_df(employees_df)
+        former_df = clean_df(former_df)
+        instructor_df = clean_df(instructor_df)
+        new_joiners_df = clean_df(new_joiners_df)
+
         total_employees = len(employees_df)
         total_leavers = len(former_df)
         total_joiners = len(new_joiners_df)
@@ -177,19 +206,20 @@ async def chat_with_ceo_ai(body: ChatRequest):
         # ---- Turnover cost (30% of annual salary of leavers) ----
         turnover_cost_qr = 0.0
 
-        # Simple logic: former_employees ke salary columns se
         if total_leavers > 0 and "basic_salary" in former_df.columns:
             if "total_salary" in former_df.columns:
                 monthly = former_df["total_salary"].fillna(0)
             else:
                 monthly = (
                     former_df["basic_salary"].fillna(0)
-                    + former_df.get("housing_allowance", 0).fillna(0)
-                    + former_df.get("transport_allowance", 0).fillna(0)
+                    + former_df.get("housing_allowance", pd.Series(0, index=former_df.index)).fillna(0)
+                    + former_df.get("transport_allowance", pd.Series(0, index=former_df.index)).fillna(0)
                 )
 
             annual = monthly * 12
-            turnover_cost_qr = float((annual * 0.3).sum())
+            turnover_cost_val = float((annual * 0.3).sum())
+            # Guard against NaN/inf from computation
+            turnover_cost_qr = turnover_cost_val if np.isfinite(turnover_cost_val) else 0.0
         else:
             turnover_cost_qr = 0.0
 
@@ -199,7 +229,7 @@ async def chat_with_ceo_ai(body: ChatRequest):
             "former_employees": total_leavers,
             "attrition_rate": attrition_rate,
             "turnover_cost_qr": turnover_cost_qr,
-            "new_joiners_count": total_joiners,  # AI ke overview ke liye
+            "new_joiners_count": total_joiners,
         }
 
         # ---- Performance metrics (from instructor_performance) ----
@@ -211,33 +241,32 @@ async def chat_with_ceo_ai(body: ChatRequest):
             "probation_failed_names": [],
         }
 
-        # instructor_performance: employee_id, employee_name, overall_rating, overall_score, ...
         if not instructor_df.empty and "overall_rating" in instructor_df.columns:
-            total_reviews = len(instructor_df)
+            # Drop rows where overall_rating is None/NaN before string ops
+            rating_df = instructor_df[instructor_df["overall_rating"].notna()].copy()
+            total_reviews = len(rating_df)
 
-            # Poor performers: rating "Below Expectations" ya "Needs Improvement"
-            poor_mask = instructor_df["overall_rating"].str.lower().isin(
+            poor_mask = rating_df["overall_rating"].str.lower().isin(
                 ["below expectations", "needs improvement"]
             )
             performance_metrics["poor_performers_count"] = int(poor_mask.sum())
 
-            # Exceed expectations %
-            good_mask = instructor_df["overall_rating"].str.lower() == "exceed expectations"
+            good_mask = rating_df["overall_rating"].str.lower() == "exceed expectations"
             performance_metrics["exceed_expectations_pct"] = (
                 round((good_mask.sum() / total_reviews) * 100, 1)
                 if total_reviews
                 else 0.0
             )
 
-            # Top performer by overall_score, phir recent review_date
             if "overall_score" in instructor_df.columns:
-                sorted_perf = instructor_df.sort_values(
+                sorted_perf = instructor_df.dropna(subset=["overall_score"]).sort_values(
                     by=["overall_score", "review_date"],
                     ascending=[False, False]
                 )
-                top_row = sorted_perf.iloc[0]
-                if "employee_name" in sorted_perf.columns:
-                    performance_metrics["top_performer_name"] = top_row["employee_name"]
+                if not sorted_perf.empty:
+                    top_row = sorted_perf.iloc[0]
+                    if "employee_name" in sorted_perf.columns:
+                        performance_metrics["top_performer_name"] = top_row["employee_name"]
 
         # ---- Call AI logic ----
         reply = answer_ceo_question(
