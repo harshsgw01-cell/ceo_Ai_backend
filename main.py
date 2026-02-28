@@ -50,6 +50,32 @@ def df_to_list(df: pd.DataFrame):
     return df.to_dict(orient="records")
 
 
+# --------- Generic JSON-safe helper (NaN, inf, date) ---------
+
+
+def make_json_safe(obj):
+    """
+    Recursively convert NaN/inf to None and date/datetime to ISO strings
+    in any nested dict/list structure so JSONResponse never fails.
+    """
+    if isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_safe(v) for v in obj]
+    if isinstance(obj, float):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, (np.floating, np.integer)):
+        v = obj.item()
+        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+            return None
+        return v
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    return obj
+
+
 # ---------- Root health-check ----------
 
 
@@ -89,22 +115,13 @@ async def hr_dashboard():
             "engagement_score": 0,
         }
 
-        # NaN / inf / date ko JSON-safe banane ke liye helper
+        # DataFrames ko basic NaN/inf clean + list me convert
         def df_safe(df: pd.DataFrame):
-            # NaN / inf clean
             df = df.replace({np.nan: None, np.inf: None, -np.inf: None})
-
-            # date/datetime -> string (ISO format)
+            # datetime64 columns ko string bana do
             for col in df.columns:
                 if df[col].dtype == "datetime64[ns]":
                     df[col] = df[col].dt.strftime("%Y-%m-%d")
-                else:
-                    df[col] = df[col].apply(
-                        lambda v: v.isoformat()
-                        if isinstance(v, (date, datetime))
-                        else v
-                    )
-
             return df.to_dict(orient="records")
 
         payload = {
@@ -116,7 +133,8 @@ async def hr_dashboard():
             "former": df_safe(former_df),
         }
 
-        return JSONResponse(content=payload)
+        safe_payload = make_json_safe(payload)
+        return JSONResponse(content=safe_payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
