@@ -29,7 +29,7 @@ pyodbc.pooling = True
 
 def get_connection():
     return pyodbc.connect(
-        "DRIVER={ODBC Driver 17 for SQL Server};"
+        "DRIVER={ODBC Driver 18 for SQL Server};"
         "SERVER=103.171.180.23;"
         "DATABASE=CEO_DASH;"
         "UID=CEO_DASH;"
