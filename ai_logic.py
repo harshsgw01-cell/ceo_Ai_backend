@@ -3,6 +3,7 @@
 import os
 from typing import Dict, Any, List
 
+import numpy as np
 import pandas as pd
 import re
 from dotenv import load_dotenv
@@ -38,6 +39,73 @@ QUESTION FROM CEO:
 
 Now give a clear, executive summary answer with risks and suggested actions.
 """
+
+# ===================== NaN/inf SAFETY HELPERS (ADDED) =================
+
+def _safe_float(val, default=0.0) -> float:
+    """Convert any value to a JSON-safe float, returning default for NaN/inf/None."""
+    try:
+        v = float(val)
+        if np.isnan(v) or np.isinf(v):
+            return default
+        return v
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(val, default=0) -> int:
+    """Convert any value to a JSON-safe int, returning default for NaN/None."""
+    try:
+        v = float(val)
+        if np.isnan(v) or np.isinf(v):
+            return default
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_str(val, default=None):
+    """Return string or default if val is NaN/None/empty."""
+    if val is None:
+        return default
+    if isinstance(val, float) and (np.isnan(val) or np.isinf(val)):
+        return default
+    s = str(val).strip()
+    return s if s else default
+
+
+def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace inf/-inf/NaN with None and convert datetime64 columns to strings."""
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.where(pd.notnull(df), None)
+    for col in df.columns:
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            df[col] = df[col].dt.strftime("%Y-%m-%d").where(df[col].notna(), None)
+    return df
+
+
+def _safe_series_sum(series: pd.Series, default=0.0) -> float:
+    """Sum a series and return a JSON-safe float."""
+    return _safe_float(series.fillna(0).replace([np.inf, -np.inf], 0).sum(), default)
+
+
+def _safe_dict(d: dict) -> dict:
+    """Recursively sanitize a dict so all float/int values are JSON-safe."""
+    result = {}
+    for k, v in d.items():
+        key = _safe_str(k, default=str(k))
+        if isinstance(v, dict):
+            result[key] = _safe_dict(v)
+        elif isinstance(v, list):
+            result[key] = v
+        elif isinstance(v, (float, np.floating)):
+            result[key] = _safe_float(v)
+        elif isinstance(v, (np.integer,)):
+            result[key] = _safe_int(v)
+        else:
+            result[key] = v
+    return result
+
 
 # ===================== BASE METRIC FALLBACKS ==========================
 
@@ -92,37 +160,50 @@ def build_hr_overview(
         "probation_failed_names": [],
     }
 
-    employees_df = employees_df if employees_df is not None else pd.DataFrame()
-    former_df = former_df if former_df is not None else pd.DataFrame()
+    # ADDED: sanitize DataFrames upfront
+    employees_df = _clean_df(employees_df) if employees_df is not None else pd.DataFrame()
+    former_df = _clean_df(former_df) if former_df is not None else pd.DataFrame()
 
     # ---------- Workforce KPIs from employees_df ----------
 
     monthly_payroll_qr = m.get("monthly_payroll_qr")
     if (monthly_payroll_qr is None or monthly_payroll_qr == 0) and not employees_df.empty:
         if "total_salary" in employees_df.columns:
-            monthly_payroll_qr = float(employees_df["total_salary"].sum())
+            # FIXED: safe sum instead of raw float()
+            monthly_payroll_qr = _safe_series_sum(employees_df["total_salary"])
         else:
             monthly_payroll_qr = 0.0
 
     avg_tenure_years = m.get("avg_tenure_years")
     if (avg_tenure_years is None or avg_tenure_years == 0) and not employees_df.empty:
         if "date_of_joining" in employees_df.columns:
-            tmp = employees_df.copy()
-            tmp["doj"] = pd.to_datetime(tmp["date_of_joining"])
-            tmp["tenure_years"] = (pd.Timestamp("today") - tmp["doj"]).dt.days / 365
-            avg_tenure_years = round(tmp["tenure_years"].mean(), 1)
+            try:
+                tmp = employees_df.copy()
+                # FIXED: errors="coerce" + dropna so bad dates don't produce NaN tenure
+                tmp["doj"] = pd.to_datetime(tmp["date_of_joining"], errors="coerce")
+                tmp = tmp.dropna(subset=["doj"])
+                if not tmp.empty:
+                    tmp["tenure_years"] = (pd.Timestamp("today") - tmp["doj"]).dt.days / 365
+                    avg_tenure_years = _safe_float(round(tmp["tenure_years"].mean(), 1))
+                else:
+                    avg_tenure_years = 0.0
+            except Exception:
+                avg_tenure_years = 0.0
         else:
             avg_tenure_years = 0.0
 
     nationality_split = m.get("nationality_split") or {}
     if not nationality_split and not employees_df.empty and "nationality" in employees_df.columns:
-        nationality_split = (
+        raw_split = (
             employees_df["nationality"]
+            .dropna()
             .value_counts(normalize=True)
             .mul(100)
             .round(1)
             .to_dict()
         )
+        # FIXED: sanitize keys and values
+        nationality_split = {_safe_str(k, str(k)): _safe_float(v) for k, v in raw_split.items()}
 
     married_pct = m.get("married_pct")
     single_pct = m.get("single_pct")
@@ -130,12 +211,14 @@ def build_hr_overview(
         if "contract_type" in employees_df.columns:
             ct = (
                 employees_df["contract_type"]
+                .dropna()
                 .value_counts(normalize=True)
                 .mul(100)
                 .round(1)
             )
-            married_pct = float(ct.get("Married", 0))
-            single_pct = float(ct.get("Single", 0))
+            # FIXED: safe float
+            married_pct = _safe_float(ct.get("Married", 0))
+            single_pct = _safe_float(ct.get("Single", 0))
         else:
             married_pct = 0.0
             single_pct = 0.0
@@ -153,7 +236,9 @@ def build_hr_overview(
 
         if "dateofleaving" in former_df.columns:
             fd = former_df.copy()
-            fd["dol"] = pd.to_datetime(fd["dateofleaving"])
+            # FIXED: errors="coerce" + dropna
+            fd["dol"] = pd.to_datetime(fd["dateofleaving"], errors="coerce")
+            fd = fd.dropna(subset=["dol"])
             last_year = pd.Timestamp("today").year - 1
             last_year_leavers = fd[fd["dol"].dt.year == last_year]
             turnover_last_year = len(last_year_leavers)
@@ -171,12 +256,13 @@ def build_hr_overview(
         }
 
         if "department" in former_df.columns:
-            dept_counts = former_df["department"].value_counts()
+            dept_counts = former_df["department"].dropna().value_counts()
             if not dept_counts.empty:
-                top_turnover_department = dept_counts.index[0]
-                top_turnover_pct = round(
+                top_turnover_department = _safe_str(dept_counts.index[0])
+                # FIXED: safe float
+                top_turnover_pct = _safe_float(round(
                     (dept_counts.iloc[0] / total_leavers) * 100, 1
-                )
+                ))
 
         if "terminationsubreason" in former_df.columns and "terminationtype" in former_df.columns:
             reason_counts = (
@@ -203,11 +289,14 @@ def build_hr_overview(
         leavers = former_df.merge(sal, on="employee_number", how="left")
         leavers["annual_salary"] = leavers["total_salary"].fillna(0) * 12
         leavers["turnover_cost_est"] = leavers["annual_salary"] * 0.3
-        turnover_cost_qr = float(leavers["turnover_cost_est"].sum())
+        # FIXED: safe sum
+        turnover_cost_qr = _safe_float(
+            leavers["turnover_cost_est"].replace([np.inf, -np.inf], 0).sum()
+        )
     elif turnover_cost_qr is None:
         turnover_cost_qr = 0.0
 
-    return {
+    overview = {
         "total_employees": m.get("total_employees"),
         "active_employees": m.get("active_employees"),
         "former_employees": m.get("former_employees"),
@@ -238,7 +327,13 @@ def build_hr_overview(
         "top_performer_name": p.get("top_performer_name"),
         "probation_failed_count": p.get("probation_failed_count"),
         "probation_failed_names": p.get("probation_failed_names"),
+        "total_departments": m.get("total_departments", 0),
+        "department_names": m.get("department_names", []),
+        "department_breakdown": m.get("department_breakdown", []),
     }
+
+    # ADDED: final sanitization pass on the entire overview dict
+    return _safe_dict(overview)
 
 # ===================== LOOKUP HELPERS =================================
 
@@ -259,7 +354,8 @@ def lookup_term_in_hr_data(
             summary["department_name"] = term
             summary["headcount"] = int(len(dept_rows))
             if "total_salary" in dept_rows.columns:
-                summary["monthly_payroll_qr"] = float(dept_rows["total_salary"].sum())
+                # FIXED: safe sum
+                summary["monthly_payroll_qr"] = _safe_series_sum(dept_rows["total_salary"])
             if "job_title" in dept_rows.columns:
                 summary["top_roles"] = (
                     dept_rows["job_title"].value_counts().head(5).to_dict()
@@ -272,7 +368,9 @@ def lookup_term_in_hr_data(
             summary["leavers_total"] = int(len(dept_leavers))
             if "dateofleaving" in dept_leavers.columns:
                 fd = dept_leavers.copy()
-                fd["dol"] = pd.to_datetime(fd["dateofleaving"])
+                # FIXED: errors="coerce" + dropna
+                fd["dol"] = pd.to_datetime(fd["dateofleaving"], errors="coerce")
+                fd = fd.dropna(subset=["dol"])
                 last_year = pd.Timestamp("today").year - 1
                 last_year_leavers = fd[fd["dol"].dt.year == last_year]
                 summary["leavers_last_year"] = int(len(last_year_leavers))
@@ -282,7 +380,8 @@ def lookup_term_in_hr_data(
                 )
 
     return summary
-#===========================================gelberish===========================================
+
+# ===========================================gibberish===========================================
 def is_gibberish(text: str) -> bool:
         text = text.strip()
 
@@ -327,9 +426,11 @@ def answer_ceo_question(
 
     # If not gibberish, continue with your existing logic
     q = q_raw.lower()
-    employees_df = employees_df if employees_df is not None else pd.DataFrame()
-    former_df = former_df if former_df is not None else pd.DataFrame()
-    new_joiners_df = new_joiners_df if new_joiners_df is not None else pd.DataFrame()
+
+    # ADDED: sanitize all incoming DataFrames once at the top
+    employees_df = _clean_df(employees_df) if employees_df is not None else pd.DataFrame()
+    former_df = _clean_df(former_df) if former_df is not None else pd.DataFrame()
+    new_joiners_df = _clean_df(new_joiners_df) if new_joiners_df is not None else pd.DataFrame()
 
     # 0) Department / term direct lookup
     words = [w.strip(".,!? ") for w in q.split() if len(w) > 1]
@@ -406,14 +507,64 @@ def answer_ceo_question(
         # Agar generic new joiner question hai
         return f"There are {len(new_joiners_df)} new joiners on record in the current dataset."
 
-    # 2) Nationality questions
+    # 1.5) Department count / list questions
+    if any(k in q for k in ["how many department", "number of department", "total department",
+                              "kitne department", "departments are there", "list of department",
+                              "department list", "which department", "all department"]):
+        total_depts = (base_metrics or {}).get("total_departments", 0)
+        dept_names = (base_metrics or {}).get("department_names", [])
+
+        if not total_depts and not employees_df.empty and "department" in employees_df.columns:
+            unique_depts = employees_df["department"].dropna().unique().tolist()
+            total_depts = len(unique_depts)
+            dept_names = [str(d) for d in unique_depts]
+
+        if total_depts == 0:
+            return "Department data is not available in the current dataset."
+
+        names_str = ", ".join(dept_names) if dept_names else "details not available"
+
+        if any(k in q for k in ["how many", "kitne", "number", "total", "count"]):
+            return (
+                f"There are currently {total_depts} departments in the organization. "
+                f"They are: {names_str}."
+            )
+        return (
+            f"The organization has {total_depts} departments: {names_str}."
+        )
+
+    # 1.6) Department-wise breakdown / details
+    if any(k in q for k in ["department breakdown", "department wise", "department detail",
+                              "each department", "per department", "department stats",
+                              "department summary"]):
+        dept_breakdown = (base_metrics or {}).get("department_breakdown", [])
+
+        if not dept_breakdown and not employees_df.empty and "department" in employees_df.columns:
+            return (
+                "Department breakdown data is not available in detail. "
+                f"There are {employees_df['department'].nunique()} departments total."
+            )
+
+        if not dept_breakdown:
+            return "Department breakdown data is not available in the current dataset."
+
+        lines = ["Here is the department-wise summary:"]
+        for d in dept_breakdown:
+            lines.append(
+                f"• {d['department']}: {d['active_count']} active employees, "
+                f"{d['former_count']} leavers, attrition {d['attrition_rate']}%, "
+                f"monthly payroll QAR {round(d['monthly_payroll_qr'], 0)}"
+            )
+        return "\n".join(lines)
+
+
     if any(k in q for k in NATIONALITY_KEYWORDS):
         if employees_df.empty or "nationality" not in employees_df.columns:
             return (
                 "Nationality data is not available in the current dataset, so I cannot show a breakdown by country."
             )
 
-        nat_series = employees_df["nationality"].str.lower()
+        nat_series = employees_df["nationality"].dropna().str.lower()
         total_emp = len(employees_df)
 
         # ---------- 1) Generic: names of <nationality> employees ----------
@@ -439,7 +590,7 @@ def answer_ceo_question(
                     "'names of Indian employees' or 'names of Qatari employees'."
                 )
 
-            mask = nat_series == target_nat
+            mask = employees_df["nationality"].str.lower() == target_nat
             sub_df = employees_df[mask]
             count = len(sub_df)
             pct = round((count / total_emp) * 100, 1) if total_emp else 0
@@ -464,13 +615,14 @@ def answer_ceo_question(
         # ---------- 2) Only count questions (e.g. 'How many Indian employees') ----------
         nat_split = (
             employees_df["nationality"]
+            .dropna()
             .value_counts(normalize=True)
             .mul(100)
             .round(1)
         )
 
         if "indian" in q:
-            count = (nat_series == "indian").sum()
+            count = (employees_df["nationality"].str.lower() == "indian").sum()
             pct = round((count / total_emp) * 100, 1) if total_emp else 0
             return (
                 f"We currently have {count} Indian employees, which is about {pct}% of the workforce."

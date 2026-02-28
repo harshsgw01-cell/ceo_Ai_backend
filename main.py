@@ -6,6 +6,7 @@ from datetime import date, datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -50,66 +51,48 @@ def df_to_list(df: pd.DataFrame):
     return df.to_dict(orient="records")
 
 
-# --------- Generic JSON-safe helper (NaN, inf, date) ---------
+# --------- ADDED: Department breakdown helper ---------
 
-
-def make_json_safe(obj):
+def build_department_breakdown(employees_df: pd.DataFrame, former_df: pd.DataFrame) -> list:
     """
-    Recursively convert NaN/inf to None and date/datetime to ISO strings
-    in any nested dict/list structure so JSONResponse never fails.
+    Build per-department summary: active count, former count, payroll, attrition rate.
+    Returns a JSON-safe list of dicts.
     """
-    if isinstance(obj, dict):
-        return {k: make_json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [make_json_safe(v) for v in obj]
-    if isinstance(obj, float):
-        if np.isnan(obj) or np.isinf(obj):
-            return None
-        return obj
-    if isinstance(obj, (np.floating, np.integer)):
-        v = obj.item()
-        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
-            return None
-        return v
-    if isinstance(obj, (date, datetime)):
-        return obj.isoformat()
-    # Handle numpy bool
-    if isinstance(obj, np.bool_):
-        return bool(obj)
-    return obj
+    if employees_df.empty or "department" not in employees_df.columns:
+        return []
 
+    dept_counts = employees_df["department"].dropna().value_counts()
+    breakdown = []
 
-def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fully sanitize a DataFrame:
-    - Replace NaN/inf/-inf with None
-    - Convert datetime64 columns to ISO date strings
-    - Convert any remaining numpy types to native Python types
-    """
-    # Replace inf values first, then NaN
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.where(pd.notnull(df), None)
+    for dept_name, active_cnt in dept_counts.items():
+        former_cnt = 0
+        if not former_df.empty and "department" in former_df.columns:
+            former_cnt = int((former_df["department"] == dept_name).sum())
 
-    for col in df.columns:
-        # datetime64 → string
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            df[col] = df[col].dt.strftime("%Y-%m-%d").where(df[col].notna(), None)
-        # object columns may contain mixed types including numpy scalars
-        elif df[col].dtype == object:
-            df[col] = df[col].apply(
-                lambda x: x.item() if isinstance(x, (np.floating, np.integer, np.bool_)) else x
+        monthly_pay = 0.0
+        if "total_salary" in employees_df.columns:
+            monthly_pay = float(
+                employees_df[employees_df["department"] == dept_name]["total_salary"]
+                .fillna(0).replace([np.inf, -np.inf], 0).sum()
             )
+            if not np.isfinite(monthly_pay):
+                monthly_pay = 0.0
 
-    return df
+        total_in_dept = int(active_cnt) + former_cnt
+        dept_attrition = round((former_cnt / total_in_dept) * 100, 1) if total_in_dept > 0 else 0.0
 
+        breakdown.append({
+            "department": str(dept_name),
+            "active_count": int(active_cnt),
+            "former_count": former_cnt,
+            "monthly_payroll_qr": round(monthly_pay, 2),
+            "attrition_rate": dept_attrition,
+        })
 
-def df_safe(df: pd.DataFrame):
-    """Clean DataFrame and convert to list of dicts safe for JSON serialization."""
-    return clean_df(df).to_dict(orient="records")
+    return breakdown
 
 
 # ---------- Root health-check ----------
-
 
 @app.get("/")
 async def root():
@@ -117,7 +100,6 @@ async def root():
 
 
 # ---------- HR dashboard endpoint ----------
-
 
 @app.get("/api/hr-dashboard")
 async def hr_dashboard():
@@ -147,6 +129,17 @@ async def hr_dashboard():
             "engagement_score": 0,
         }
 
+        # DataFrames -> basic clean
+        def df_safe(df: pd.DataFrame):
+            df = df.replace({np.nan: None, np.inf: None, -np.inf: None})
+            for col in df.columns:
+                if df[col].dtype == "datetime64[ns]":
+                    df[col] = df[col].dt.strftime("%Y-%m-%d")
+            return df.to_dict(orient="records")
+
+        # ADDED: department breakdown
+        department_breakdown = build_department_breakdown(employees_df, former_df)
+
         payload = {
             "employee": employee_summary,
             "employees": df_safe(employees_df),
@@ -154,16 +147,16 @@ async def hr_dashboard():
             "instructors": df_safe(instructor_df),
             "employee_trend": [],
             "former": df_safe(former_df),
+            "department_breakdown": department_breakdown,  # ADDED
         }
 
-        safe_payload = make_json_safe(payload)
-        return JSONResponse(content=safe_payload)
+        safe_content = jsonable_encoder(payload)
+        return JSONResponse(content=safe_content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------- Models ----------
-
 
 class ChatRequest(BaseModel):
     prompt: str
@@ -175,7 +168,6 @@ class ChatResponse(BaseModel):
 
 # ---------- AI chat endpoint (uses ai_logic) ----------
 
-
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_with_ceo_ai(body: ChatRequest):
     try:
@@ -185,12 +177,6 @@ async def chat_with_ceo_ai(body: ChatRequest):
         instructor_df = pd.read_sql(f"SELECT * FROM [{INSTRUCTORS_TABLE}]", conn)
         new_joiners_df = pd.read_sql(f"SELECT * FROM [{NEW_JOINERS_TABLE}]", conn)
         conn.close()
-
-        # Sanitize all DataFrames before any processing
-        employees_df = clean_df(employees_df)
-        former_df = clean_df(former_df)
-        instructor_df = clean_df(instructor_df)
-        new_joiners_df = clean_df(new_joiners_df)
 
         total_employees = len(employees_df)
         total_leavers = len(former_df)
@@ -212,16 +198,19 @@ async def chat_with_ceo_ai(body: ChatRequest):
             else:
                 monthly = (
                     former_df["basic_salary"].fillna(0)
-                    + former_df.get("housing_allowance", pd.Series(0, index=former_df.index)).fillna(0)
-                    + former_df.get("transport_allowance", pd.Series(0, index=former_df.index)).fillna(0)
+                    + former_df.get("housing_allowance", 0).fillna(0)
+                    + former_df.get("transport_allowance", 0).fillna(0)
                 )
 
             annual = monthly * 12
-            turnover_cost_val = float((annual * 0.3).sum())
-            # Guard against NaN/inf from computation
-            turnover_cost_qr = turnover_cost_val if np.isfinite(turnover_cost_val) else 0.0
+            turnover_cost_qr = float((annual * 0.3).sum())
         else:
             turnover_cost_qr = 0.0
+
+        # ADDED: department stats for AI
+        department_breakdown_list = build_department_breakdown(employees_df, former_df)
+        total_departments = len(department_breakdown_list)
+        department_names = [d["department"] for d in department_breakdown_list]
 
         base_metrics = {
             "total_employees": total_employees,
@@ -230,9 +219,13 @@ async def chat_with_ceo_ai(body: ChatRequest):
             "attrition_rate": attrition_rate,
             "turnover_cost_qr": turnover_cost_qr,
             "new_joiners_count": total_joiners,
+            # ADDED: department info so AI can answer department questions
+            "total_departments": total_departments,
+            "department_names": department_names,
+            "department_breakdown": department_breakdown_list,
         }
 
-        # ---- Performance metrics (from instructor_performance) ----
+        # ---- Performance metrics (from instructor_performance + probation) ----
         performance_metrics = {
             "poor_performers_count": 0,
             "exceed_expectations_pct": 0.0,
@@ -241,17 +234,18 @@ async def chat_with_ceo_ai(body: ChatRequest):
             "probation_failed_names": [],
         }
 
+        # instructor_performance: poor / exceed / top performer
         if not instructor_df.empty and "overall_rating" in instructor_df.columns:
-            # Drop rows where overall_rating is None/NaN before string ops
-            rating_df = instructor_df[instructor_df["overall_rating"].notna()].copy()
-            total_reviews = len(rating_df)
+            total_reviews = len(instructor_df)
 
-            poor_mask = rating_df["overall_rating"].str.lower().isin(
-                ["below expectations", "needs improvement"]
+            poor_mask = instructor_df["overall_rating"].str.lower().isin(
+                ["below expectations", "needs improvement", "poor performer"]
             )
             performance_metrics["poor_performers_count"] = int(poor_mask.sum())
 
-            good_mask = rating_df["overall_rating"].str.lower() == "exceed expectations"
+            good_mask = instructor_df["overall_rating"].str.lower().isin(
+                ["exceed expectations"]
+            )
             performance_metrics["exceed_expectations_pct"] = (
                 round((good_mask.sum() / total_reviews) * 100, 1)
                 if total_reviews
@@ -259,14 +253,30 @@ async def chat_with_ceo_ai(body: ChatRequest):
             )
 
             if "overall_score" in instructor_df.columns:
-                sorted_perf = instructor_df.dropna(subset=["overall_score"]).sort_values(
+                sorted_perf = instructor_df.sort_values(
                     by=["overall_score", "review_date"],
                     ascending=[False, False]
                 )
-                if not sorted_perf.empty:
-                    top_row = sorted_perf.iloc[0]
-                    if "employee_name" in sorted_perf.columns:
-                        performance_metrics["top_performer_name"] = top_row["employee_name"]
+                top_row = sorted_perf.iloc[0]
+                if "employee_name" in sorted_perf.columns:
+                    performance_metrics["top_performer_name"] = top_row["employee_name"]
+
+        # NEW: probation failures from new_joiners_2023_2024
+        if not new_joiners_df.empty and "probation_status" in new_joiners_df.columns:
+            fail_mask = new_joiners_df["probation_status"].str.lower() == "failed"
+            performance_metrics["probation_failed_count"] = int(fail_mask.sum())
+
+            if (
+                "first_name" in new_joiners_df.columns
+                and "last_name" in new_joiners_df.columns
+            ):
+                performance_metrics["probation_failed_names"] = [
+                    f"{fn} {ln}"
+                    for fn, ln in zip(
+                        new_joiners_df.loc[fail_mask, "first_name"],
+                        new_joiners_df.loc[fail_mask, "last_name"],
+                    )
+                ]
 
         # ---- Call AI logic ----
         reply = answer_ceo_question(
