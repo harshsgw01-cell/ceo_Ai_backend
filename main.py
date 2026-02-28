@@ -17,7 +17,7 @@ load_dotenv()
 
 app = FastAPI(title="CEO AI Backend")
 
-origins = ["http://ceodashboard.softgoway.com"]
+origins = ["https://ceodashboard.softgoway.com", "http://localhost:3000"]
 
 app.add_middleware(
     CORSMiddleware,
