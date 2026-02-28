@@ -508,9 +508,10 @@ def answer_ceo_question(
         return f"There are {len(new_joiners_df)} new joiners on record in the current dataset."
 
     # 1.5) Department count / list questions
+    # NOTE: "which department" removed — struggling/performance questions must fall through to their own blocks
     if any(k in q for k in ["how many department", "number of department", "total department",
                               "kitne department", "departments are there", "list of department",
-                              "department list", "which department", "all department"]):
+                              "department list", "all department"]):
         total_depts = (base_metrics or {}).get("total_departments", 0)
         dept_names = (base_metrics or {}).get("department_names", [])
 
